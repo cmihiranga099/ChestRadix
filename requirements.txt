@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------
+# ChestRadix: Trustworthy AI for Emergency Chest X-Ray Triage
+# Python 3.11 to 3.13
+#
+# PyTorch note (install torch BEFORE the rest, on the laptop):
+#   CPU-only laptop:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   Kaggle and Colab already ship torch/torchvision.
+# ---------------------------------------------------------------
+
+# --- Deep learning core ---
+torch>=2.1.0,<3.0
+torchvision>=0.16.0,<1.0
+
+# --- Data and numerics ---
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+Pillow>=10.0
+opencv-python-headless>=4.8
+
+# --- Visualisation and utilities ---
+matplotlib>=3.7
+tqdm>=4.66
+PyYAML>=6.0
+
+# --- Backend microservice ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+pydantic>=2.5
+
+# --- Clinician dashboard ---
+streamlit>=1.32
+requests>=2.31
+
+# --- Latency optimisation and export ---
+onnx>=1.15
+onnxruntime>=1.17
+
+# --- Testing ---
+pytest>=7.4
+httpx>=0.26
