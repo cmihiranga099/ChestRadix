@@ -15,6 +15,17 @@ weighted kappa subject to a minimum IMMEDIATE recall (safety floor). The test sp
 used once, with patient-level bootstrap intervals. The reference tier comes from the NIH
 labels through the design-assumption mapping, not from a radiologist.
 
+Two score sources are supported and compared on the same test images:
+
+* ``classes``: the highest probability among the 14 finding outputs of each tier (E1);
+* ``head``: the two tier-head outputs trained directly on ``tier >= URGENT`` and
+  ``tier == IMMEDIATE`` (E2 and later, ``train.py --tier-head``).
+
+Because a hard tier is only useful when few cases are flagged, the report also gives
+(a) ranking quality of the tier scores (AUROC/AUPRC), and (b) a workload sweep: flag the
+top 10/20/30/40% of cases as IMMEDIATE (cut-off from validation) and report the IMMEDIATE
+recall, precision and lift that this workload buys.
+
 Command line (after ``evaluate``/``calibration`` have produced logits)::
 
     python -m src.triage --run-dir runs/e1_densenet121_s42 --logits-name logits_calibrated
@@ -32,11 +43,13 @@ import pandas as pd
 
 from src.calibration import sigmoid
 from src.config import PATHOLOGIES, PRIORITY_LEVELS, locate_processed_dir
+from src.evaluate import fast_auroc
 from src.metrics import (
     CLASS_TIERS,
     TIER_INDEX,
     choose_thresholds,
     patient_bootstrap_indices,
+    safe_auprc,
     tier_metrics,
     tiers_from_binary,
 )
@@ -65,6 +78,24 @@ def tier_scores(probabilities: np.ndarray) -> np.ndarray:
     scores = np.zeros((probabilities.shape[0], NUM_TIERS))
     for tier in range(NUM_TIERS):
         scores[:, tier] = probabilities[:, CLASS_TIERS == tier].max(axis=1)
+    return scores
+
+
+def head_scores(tier_probabilities: np.ndarray) -> np.ndarray:
+    """Tier scores from the two tier-head probabilities (same layout as :func:`tier_scores`).
+
+    Args:
+        tier_probabilities: ``(N, 2)`` probabilities of ``tier >= URGENT`` and
+            ``tier == IMMEDIATE``.
+
+    Returns:
+        ``(N, 3)`` array with the URGENT column = ``P(tier >= URGENT)`` and the IMMEDIATE
+        column = ``P(tier == IMMEDIATE)``; the unused ROUTINE column is zero.
+    """
+    tier_probabilities = np.asarray(tier_probabilities, dtype=float)
+    scores = np.zeros((tier_probabilities.shape[0], NUM_TIERS))
+    scores[:, URGENT] = tier_probabilities[:, 0]
+    scores[:, IMMEDIATE] = tier_probabilities[:, 1]
     return scores
 
 
@@ -176,7 +207,8 @@ def _interval(values: np.ndarray, alpha: float = 0.05) -> list[float]:
 
 
 def evaluate_tiers(reference: np.ndarray, predicted: np.ndarray, patient_ids: np.ndarray,
-                   n_boot: int = 1000, seed: int = 42) -> dict[str, Any]:
+                   n_boot: int = 1000, seed: int = 42,
+                   draws: list[np.ndarray] | None = None) -> dict[str, Any]:
     """Tier metrics, confusion matrix and bootstrap intervals for one decision rule.
 
     Args:
@@ -185,6 +217,8 @@ def evaluate_tiers(reference: np.ndarray, predicted: np.ndarray, patient_ids: np
         patient_ids: Patient id per image (the bootstrap resamples patients).
         n_boot: Number of bootstrap draws (0 disables intervals).
         seed: Bootstrap seed.
+        draws: Pre-computed bootstrap index arrays (saves time when several rules are
+            evaluated on the same images); built from ``patient_ids`` when omitted.
 
     Returns:
         Dictionary of metrics, ``<name>_ci`` intervals and the ``confusion`` matrix
@@ -195,8 +229,9 @@ def evaluate_tiers(reference: np.ndarray, predicted: np.ndarray, patient_ids: np
     report: dict[str, Any] = _metrics(reference, predicted)
     report["confusion"] = tier_confusion(reference, predicted).tolist()
     if n_boot > 0:
-        draws = patient_bootstrap_indices(np.asarray(patient_ids), n_boot, seed)
-        store = {name: np.full(n_boot, np.nan) for name in CI_NAMES}
+        if draws is None:
+            draws = patient_bootstrap_indices(np.asarray(patient_ids), n_boot, seed)
+        store = {name: np.full(len(draws), np.nan) for name in CI_NAMES}
         for b, idx in enumerate(draws):
             for name, value in _metrics(reference[idx], predicted[idx]).items():
                 store[name][b] = value
@@ -208,6 +243,85 @@ def evaluate_tiers(reference: np.ndarray, predicted: np.ndarray, patient_ids: np
 # --------------------------------------------------------------------------- #
 # Run-level entry point
 # --------------------------------------------------------------------------- #
+WORKLOAD_CAPS: tuple[float, ...] = (0.10, 0.20, 0.30, 0.40)
+
+
+def ranking_metrics(reference: np.ndarray, scores: np.ndarray,
+                    draws: list[np.ndarray] | None = None) -> dict[str, Any]:
+    """How well the tier scores rank cases, independent of any threshold.
+
+    Args:
+        reference: Reference tiers.
+        scores: ``(N, 3)`` tier scores.
+        draws: Bootstrap index arrays (patient-level); intervals are added when given.
+
+    Returns:
+        AUROC and AUPRC of the IMMEDIATE score for ``tier == IMMEDIATE`` and of the URGENT
+        score for ``tier >= URGENT``, with 95% intervals for the AUROCs.
+    """
+    reference = np.asarray(reference).astype(int)
+    immediate, urgent_plus = (reference == IMMEDIATE).astype(int), (reference >= URGENT).astype(int)
+    out: dict[str, Any] = {
+        "immediate_auroc": fast_auroc(immediate, scores[:, IMMEDIATE]),
+        "immediate_auprc": safe_auprc(immediate, scores[:, IMMEDIATE]),
+        "immediate_prevalence": float(immediate.mean()),
+        "urgent_plus_auroc": fast_auroc(urgent_plus, scores[:, URGENT]),
+        "urgent_plus_auprc": safe_auprc(urgent_plus, scores[:, URGENT]),
+        "urgent_plus_prevalence": float(urgent_plus.mean()),
+    }
+    if draws:
+        for key, truth, column in (("immediate_auroc", immediate, IMMEDIATE),
+                                   ("urgent_plus_auroc", urgent_plus, URGENT)):
+            values = np.array([fast_auroc(truth[idx], scores[idx, column]) for idx in draws])
+            out[f"{key}_ci"] = _interval(values)
+    return out
+
+
+def workload_sweep(val_reference: np.ndarray, val_scores: np.ndarray, test_reference: np.ndarray,
+                   test_scores: np.ndarray, draws: list[np.ndarray] | None = None,
+                   caps: tuple[float, ...] = WORKLOAD_CAPS) -> list[dict[str, Any]]:
+    """Flag the top ``cap`` share of cases as IMMEDIATE and report what that buys.
+
+    The cut-off is the ``1 - cap`` quantile of the **validation** IMMEDIATE score and is then
+    applied unchanged to the test images, so the realised test flag rate can differ slightly.
+
+    Args:
+        val_reference: Reference tiers of the validation images (unused except for symmetry).
+        val_scores: ``(N, 3)`` validation tier scores.
+        test_reference: Reference tiers of the test images.
+        test_scores: ``(N, 3)`` test tier scores.
+        draws: Patient-level bootstrap index arrays (optional, for intervals).
+        caps: Target flag rates.
+
+    Returns:
+        One row per cap with threshold, flag rate, IMMEDIATE recall, precision (share of
+        flagged cases that are truly IMMEDIATE) and lift (precision / prevalence).
+    """
+    truth = np.asarray(test_reference).astype(int) == IMMEDIATE
+    rows = []
+    for cap in caps:
+        threshold = float(np.quantile(val_scores[:, IMMEDIATE], 1.0 - cap))
+        flagged = test_scores[:, IMMEDIATE] >= threshold
+
+        def measures(idx: np.ndarray | slice) -> tuple[float, float, float, float]:
+            t, f = truth[idx], flagged[idx]
+            recall = float((t & f).sum() / t.sum()) if t.sum() else float("nan")
+            precision = float((t & f).sum() / f.sum()) if f.sum() else float("nan")
+            prevalence = float(t.mean())
+            lift = precision / prevalence if prevalence and np.isfinite(precision) else float("nan")
+            return float(f.mean()), recall, precision, lift
+
+        names = ("flag_rate", "immediate_recall", "precision", "lift")
+        row: dict[str, Any] = {"target_flag_rate": cap, "threshold": threshold,
+                               **dict(zip(names, measures(slice(None))))}
+        if draws:
+            samples = np.array([measures(idx) for idx in draws])
+            for k, name in enumerate(names):
+                row[f"{name}_ci"] = _interval(samples[:, k])
+        rows.append(row)
+    return rows
+
+
 def _floor_sweep(val_ref: np.ndarray, val_scores: np.ndarray, test_ref: np.ndarray,
                  test_scores: np.ndarray, patients: np.ndarray,
                  floors: tuple[float, ...] = (0.6, 0.7, 0.8, 0.9)) -> list[dict[str, Any]]:
@@ -228,17 +342,33 @@ def _floor_sweep(val_ref: np.ndarray, val_scores: np.ndarray, test_ref: np.ndarr
     return rows
 
 
+def _load_scores(run_dir: Path, logits_name: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Validation and test tier scores for every score source available in ``run_dir``."""
+    sources: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    val_prob = sigmoid(np.load(run_dir / f"val_{logits_name}.npy"))
+    test_prob = sigmoid(np.load(run_dir / f"test_{logits_name}.npy"))
+    sources["classes"] = (tier_scores(val_prob), tier_scores(test_prob))
+    val_head = run_dir / f"val_tier_{logits_name}.npy"
+    test_head = run_dir / f"test_tier_{logits_name}.npy"
+    if val_head.exists() and test_head.exists():
+        sources["head"] = (head_scores(sigmoid(np.load(val_head))),
+                           head_scores(sigmoid(np.load(test_head))))
+    return sources
+
+
 def triage_run(run_dir: Path, processed_dir: Path, logits_name: str = "logits_calibrated",
                recall_floor: float = 0.80, n_boot: int = 1000, seed: int = 42) -> dict[str, Any]:
     """Tune the tier rule on validation, evaluate on test and write ``triage_metrics.json``.
 
-    The report compares three decision rules on the same test images: the tuned
-    tier-level rule (``tuned``), the per-class Youden rule used by ``evaluate.py``
-    (``youden_per_class``) and the trivial rule that calls every case ROUTINE
-    (``all_routine``).
+    The report compares decision rules on the same test images: the tuned tier-level rule
+    for every available score source (``sources``), the per-class Youden rule used by
+    ``evaluate.py`` (``youden_per_class``) and the trivial rule that calls every case ROUTINE
+    (``all_routine``). The top-level ``tuning``, ``tuned`` and ``floor_sweep`` entries refer
+    to the ``head`` source when it exists and to ``classes`` otherwise.
 
     Args:
-        run_dir: Run folder containing ``val_<name>.npy`` and ``test_<name>.npy``.
+        run_dir: Run folder containing ``val_<name>.npy`` and ``test_<name>.npy`` (and
+            optionally ``val_tier_<name>.npy`` / ``test_tier_<name>.npy`` from a tier-head run).
         processed_dir: Folder with ``val.csv`` and ``test.csv``.
         logits_name: ``"logits"`` (raw) or ``"logits_calibrated"``.
         recall_floor: Minimum IMMEDIATE recall on validation.
@@ -265,27 +395,40 @@ def triage_run(run_dir: Path, processed_dir: Path, logits_name: str = "logits_ca
         raise ValueError("Saved logits do not match the split CSV files (different lengths).")
 
     val_ref, test_ref = tiers_from_binary(val_labels), tiers_from_binary(test_labels)
-    tuning = tune_tier_thresholds(val_ref, tier_scores(val_prob), recall_floor)
     patients = test["patient_id"].to_numpy()
+    draws = patient_bootstrap_indices(patients, n_boot, seed) if n_boot > 0 else None
 
-    tuned_pred = assign_tiers(tier_scores(test_prob), tuning["t_urgent"], tuning["t_immediate"])
+    sources_report: dict[str, Any] = {}
+    for name, (val_scores, test_scores) in _load_scores(run_dir, logits_name).items():
+        tuning = tune_tier_thresholds(val_ref, val_scores, recall_floor)
+        predicted = assign_tiers(test_scores, tuning["t_urgent"], tuning["t_immediate"])
+        sources_report[name] = {
+            "tuning": tuning,
+            "tuned": evaluate_tiers(test_ref, predicted, patients, n_boot, seed, draws=draws),
+            "ranking": ranking_metrics(test_ref, test_scores, draws),
+            "workload_sweep": workload_sweep(val_ref, val_scores, test_ref, test_scores, draws),
+            "floor_sweep": _floor_sweep(val_ref, val_scores, test_ref, test_scores, patients),
+        }
+    primary = "head" if "head" in sources_report else "classes"
+
     youden = choose_thresholds(val_labels, val_prob)
     youden_pred = tiers_from_binary((test_prob >= youden[None, :]).astype(int))
-
     report = {
         "logits_name": logits_name,
         "reference": "NIH labels mapped to tiers (design assumption, not a radiologist)",
         "thresholds_chosen_on": "validation",
-        "tuning": tuning,
+        "primary_source": primary,
+        "sources": sources_report,
+        "tuning": sources_report[primary]["tuning"],
+        "tuned": sources_report[primary]["tuned"],
+        "floor_sweep": sources_report[primary]["floor_sweep"],
         "tier_prevalence_test": {name: float(np.mean(test_ref == i))
                                  for i, name in enumerate(PRIORITY_LEVELS)},
         "n_images": int(len(test)),
         "n_patients": int(len(np.unique(patients))),
-        "tuned": evaluate_tiers(test_ref, tuned_pred, patients, n_boot, seed),
-        "youden_per_class": evaluate_tiers(test_ref, youden_pred, patients, n_boot, seed),
+        "youden_per_class": evaluate_tiers(test_ref, youden_pred, patients, n_boot, seed,
+                                           draws=draws),
         "all_routine": evaluate_tiers(test_ref, np.zeros_like(test_ref), patients, 0, seed),
-        "floor_sweep": _floor_sweep(val_ref, tier_scores(val_prob), test_ref,
-                                    tier_scores(test_prob), patients),
         "tier_order": list(PRIORITY_LEVELS),
     }
     with (run_dir / "triage_metrics.json").open("w", encoding="utf-8") as handle:
@@ -319,20 +462,33 @@ def main() -> None:
     processed = args.processed_dir or locate_processed_dir()
     report = triage_run(args.run_dir, processed, args.logits_name, args.recall_floor,
                         args.n_boot, args.seed)
-    tuning = report["tuning"]
-    LOGGER.info("Tuned on validation: t_urgent %.3f, t_immediate %.3f (floor met: %s)",
-                tuning["t_urgent"], tuning["t_immediate"], tuning["feasible"])
-    for rule in ("tuned", "youden_per_class"):
-        entry = report[rule]
-        LOGGER.info("[%s] weighted kappa %s | IMMEDIATE recall %s", rule,
-                    _ci_text(entry, "weighted_kappa"), _ci_text(entry, "immediate_recall"))
-        LOGGER.info("[%s] under-triage %s | over-triage %s | flagged IMMEDIATE %s", rule,
-                    _ci_text(entry, "under_triage_rate"), _ci_text(entry, "over_triage_rate"),
-                    _ci_text(entry, "immediate_flag_rate"))
-    LOGGER.info("Floor sweep (test): floor | IMMEDIATE recall | over-triage | flagged IMMEDIATE")
-    for row in report["floor_sweep"]:
-        LOGGER.info("  %.2f | %.3f | %.3f | %.3f", row["recall_floor"], row["immediate_recall"],
-                    row["over_triage_rate"], row["immediate_flag_rate"])
+    for name, block in report["sources"].items():
+        tuning, tuned, rank = block["tuning"], block["tuned"], block["ranking"]
+        LOGGER.info("=== score source: %s ===", name)
+        LOGGER.info("Tuned on validation: t_urgent %.3f, t_immediate %.3f (floor met: %s)",
+                    tuning["t_urgent"], tuning["t_immediate"], tuning["feasible"])
+        LOGGER.info("[tuned] weighted kappa %s | IMMEDIATE recall %s",
+                    _ci_text(tuned, "weighted_kappa"), _ci_text(tuned, "immediate_recall"))
+        LOGGER.info("[tuned] under-triage %s | over-triage %s | flagged IMMEDIATE %s",
+                    _ci_text(tuned, "under_triage_rate"), _ci_text(tuned, "over_triage_rate"),
+                    _ci_text(tuned, "immediate_flag_rate"))
+        LOGGER.info("Ranking: IMMEDIATE AUROC %s (AUPRC %.3f, prevalence %.3f) | urgent+ AUROC %s",
+                    _ci_text(rank, "immediate_auroc"), rank["immediate_auprc"],
+                    rank["immediate_prevalence"], _ci_text(rank, "urgent_plus_auroc"))
+        LOGGER.info("Workload: flag top X% as IMMEDIATE | realised | recall | precision | lift")
+        for row in block["workload_sweep"]:
+            LOGGER.info("  %3.0f%% | %.3f | %s | %s | %.2f", 100 * row["target_flag_rate"],
+                        row["flag_rate"], _ci_text(row, "immediate_recall"),
+                        _ci_text(row, "precision"), row["lift"])
+        LOGGER.info("Floor sweep (test): floor | IMMEDIATE recall | over-triage | flagged")
+        for row in block["floor_sweep"]:
+            LOGGER.info("  %.2f | %.3f | %.3f | %.3f", row["recall_floor"],
+                        row["immediate_recall"], row["over_triage_rate"],
+                        row["immediate_flag_rate"])
+    entry = report["youden_per_class"]
+    LOGGER.info("[youden_per_class] weighted kappa %s | IMMEDIATE recall %s | flagged %s",
+                _ci_text(entry, "weighted_kappa"), _ci_text(entry, "immediate_recall"),
+                _ci_text(entry, "immediate_flag_rate"))
     LOGGER.info("Wrote %s", args.run_dir / "triage_metrics.json")
 
 

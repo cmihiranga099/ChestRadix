@@ -29,6 +29,7 @@ import pandas as pd
 from scipy.optimize import minimize, minimize_scalar
 
 from src.config import PATHOLOGIES, locate_processed_dir
+from src.tier_head import TIER_HEAD_NAMES, tier_targets
 
 LOGGER = logging.getLogger("chestradix.calibration")
 METHODS = ("temperature", "platt")
@@ -109,22 +110,24 @@ def reliability_bins(labels: np.ndarray, probabilities: np.ndarray, n_bins: int 
     return out
 
 
-def calibration_summary(labels: np.ndarray, probabilities: np.ndarray, n_bins: int = 15
-                        ) -> dict[str, Any]:
+def calibration_summary(labels: np.ndarray, probabilities: np.ndarray, n_bins: int = 15,
+                        class_names: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Per-class and macro ECE and Brier score.
 
     Args:
         labels: ``(N, C)`` binary labels.
         probabilities: ``(N, C)`` probabilities.
         n_bins: Number of ECE bins.
+        class_names: Names of the ``C`` columns (defaults to the 14 pathologies).
 
     Returns:
         Dictionary with ``per_class`` (class, ece, brier) and ``macro_ece``, ``macro_brier``.
     """
     labels = np.asarray(labels)
+    names = class_names or PATHOLOGIES
     rows = []
     for c in range(labels.shape[1]):
-        name = PATHOLOGIES[c] if c < len(PATHOLOGIES) else str(c)
+        name = names[c] if c < len(names) else str(c)
         rows.append({"class": name,
                      "ece": expected_calibration_error(labels[:, c], probabilities[:, c], n_bins),
                      "brier": brier_score(labels[:, c], probabilities[:, c])})
@@ -267,9 +270,36 @@ def calibrate_run(run_dir: Path, processed_dir: Path, method: str = "auto",
             "raw": reliability_bins(test_labels, sigmoid(test_logits), n_bins),
             "calibrated": reliability_bins(test_labels, sigmoid(cal_test), n_bins)},
     }
+    if (run_dir / "val_tier_logits.npy").exists() and (run_dir / "test_tier_logits.npy").exists():
+        report["tier_head"] = _calibrate_tier_head(run_dir, val_labels, test_labels, n_bins)
     with (run_dir / "calibration.json").open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
     return report
+
+
+def _calibrate_tier_head(run_dir: Path, val_labels: np.ndarray, test_labels: np.ndarray,
+                         n_bins: int) -> dict[str, Any]:
+    """Per-output Platt calibration of the two tier-head logits (fitted on validation only).
+
+    Writes ``val_tier_logits_calibrated.npy`` and ``test_tier_logits_calibrated.npy``.
+
+    Returns:
+        Report with the fitted ``(slope, intercept)`` per output and ECE/Brier before and after.
+    """
+    val_logits = np.load(run_dir / "val_tier_logits.npy").astype(float)
+    test_logits = np.load(run_dir / "test_tier_logits.npy").astype(float)
+    val_targets, test_targets = tier_targets(val_labels), tier_targets(test_labels)
+    params = fit_platt(val_logits, val_targets)
+    cal_val, cal_test = apply_platt(val_logits, params), apply_platt(test_logits, params)
+    np.save(run_dir / "val_tier_logits_calibrated.npy", cal_val.astype(np.float32))
+    np.save(run_dir / "test_tier_logits_calibrated.npy", cal_test.astype(np.float32))
+    names = TIER_HEAD_NAMES
+    return {
+        "method": "platt", "outputs": list(names), "slope_intercept": params.tolist(),
+        "raw_test": calibration_summary(test_targets, sigmoid(test_logits), n_bins, names),
+        "calibrated_val": calibration_summary(val_targets, sigmoid(cal_val), n_bins, names),
+        "calibrated_test": calibration_summary(test_targets, sigmoid(cal_test), n_bins, names),
+    }
 
 
 def plot_reliability(report: dict[str, Any], path: Path) -> None:
@@ -322,6 +352,10 @@ def main() -> None:
         LOGGER.info("Test macro ECE / Brier  %-11s: %.4f / %.4f  %s%s", name,
                     entry["test"]["macro_ece"], entry["test"]["macro_brier"],
                     entry["parameters"] if name == "temperature" else "", mark)
+    if "tier_head" in report:
+        tier = report["tier_head"]
+        LOGGER.info("Tier head test macro ECE  raw: %.4f  platt: %.4f (saved)",
+                    tier["raw_test"]["macro_ece"], tier["calibrated_test"]["macro_ece"])
     plot_reliability(report, args.run_dir / "reliability_test.png")
     LOGGER.info("Wrote %s", args.run_dir / "calibration.json")
 
