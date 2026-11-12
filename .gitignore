@@ -32,3 +32,5 @@ kaggle.json
 Thumbs.db
 .idea/
 .vscode/
+data/expert/
+data/gradcam_subset/
