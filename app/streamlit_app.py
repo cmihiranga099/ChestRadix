@@ -36,7 +36,7 @@ except requests.RequestException:
     st.stop()
 
 upload = st.file_uploader("Chest radiograph (PNG or JPEG)", type=["png", "jpg", "jpeg"])
-choice = st.selectbox("Explain which finding (Grad-CAM)", ["Finding that decided the tier"] + names)
+choice = st.selectbox("Explain which finding (heat map)", ["Finding that decided the tier"] + names)
 show_anyway = st.checkbox("Show the heat map even when no finding passed the thresholds (weak evidence)")
 
 if upload is not None and st.button("Triage", type="primary"):
@@ -73,7 +73,8 @@ if upload is not None and st.button("Triage", type="primary"):
                    "means something when the model has found something to point at. Pick a finding in "
                    "the list above to see where the model looked anyway.")
     else:
-        cam_caption = f"Grad-CAM for {explained} ({p_explained:.1%}): where the model looked, not a diagnosis."
+        cam_caption = (f"Grad-CAM-style heat map (LayerCAM) for {explained} ({p_explained:.1%}): "
+                       f"where the model looked, not a diagnosis.")
         if routine and default_finding:
             cam_caption += " No finding passed the thresholds, so this map is weak evidence."
         if p_explained < 0.20:
