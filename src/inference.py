@@ -8,7 +8,8 @@ For one radiograph the predictor
 4. assigns the tier (IMMEDIATE / URGENT / ROUTINE) with the thresholds tuned on validation,
 5. measures **disagreement between the members** (each calibrated on its own) and flags the case
    "low confidence, needs a human look" when it is above the validation cut-off,
-6. explains the finding that decided the tier with Grad-CAM (average over the members).
+6. explains the finding that decided the tier with a LayerCAM heat map (average over the members),
+   read from an earlier, sharper layer than plain Grad-CAM (see :mod:`src.cam_methods`).
 
 Everything it needs is read from run folders that the earlier stages already wrote:
 
@@ -34,7 +35,7 @@ from PIL import Image
 from src.calibration import sigmoid
 from src.config import NUM_CLASSES, PATHOLOGIES
 from src.dataset import build_transforms
-from src.gradcam import gradcam_maps, overlay
+from src.cam_methods import cam_maps, focused_overlay
 from src.metrics import CLASS_TIERS
 from src.tier_head import load_checkpoint_any
 from src.triage import assign_tiers, tier_scores
@@ -42,6 +43,8 @@ from src.uncertainty import uncertainty_scores
 
 LOGGER = logging.getLogger("chestradix.inference")
 TIER_NAMES: tuple[str, ...] = ("ROUTINE", "URGENT", "IMMEDIATE")
+# Heat-map layer per backbone: 14 x 14 instead of the 7 x 7 last layer (better on the NIH boxes, Stage 13).
+CAM_LAYERS: dict[str, str] = {"densenet121": "features.denseblock3", "resnet50": "layer3"}
 DISCLAIMER = ("Research prototype for decision support only. Not a medical device and not validated "
               "for clinical use. A qualified clinician must review every case.")
 
@@ -96,7 +99,7 @@ class TriagePredictor:
     """Ensemble triage, uncertainty flag and Grad-CAM for single images."""
 
     def __init__(self, member_runs: list[Path], ensemble_run: Path, flag_rate: float = 0.2,
-                 device: str = "cpu") -> None:
+                 device: str = "cpu", cam_method: str = "layercam", cam_level: float = 0.5) -> None:
         """Load the members and the ensemble settings.
 
         Args:
@@ -106,6 +109,9 @@ class TriagePredictor:
             flag_rate: Share of cases to flag as low confidence (the cut-off is the ``1 - flag_rate``
                 quantile of the validation uncertainty).
             device: ``"cpu"`` or ``"cuda"``.
+            cam_method: Heat-map method (``"layercam"``, ``"gradcam"`` or ``"gradcampp"``).
+            cam_level: Share of the heat-map maximum below which the overlay draws nothing
+                (0 draws the whole map; 0.5 shows only the strongest region).
 
         Raises:
             ValueError: If fewer than two members are given, their image sizes differ, or the
@@ -114,6 +120,8 @@ class TriagePredictor:
         if len(member_runs) < 2:
             raise ValueError("The uncertainty flag needs at least two members.")
         self.device = device
+        self.cam_method = cam_method
+        self.cam_level = float(cam_level)
         self.models: list[torch.nn.Module] = []
         self.backbones: list[str] = []
         self.member_calibrations: list[Callable[[np.ndarray], np.ndarray]] = []
@@ -189,7 +197,8 @@ class TriagePredictor:
         candidates = np.where(CLASS_TIERS == tier, probabilities, -1.0) if tier > 0 else probabilities
         deciding = int(np.argmax(candidates))
         explained = PATHOLOGIES.index(finding) if finding else deciding
-        cams = np.stack([gradcam_maps(model, batch, explained, backbone)[0]
+        cams = np.stack([cam_maps(model, batch, explained, backbone, self.cam_method,
+                                  CAM_LAYERS[backbone] if self.cam_method != "gradcam" else None)[0]
                          for model, backbone in zip(self.models, self.backbones)]).mean(axis=0)
         span = cams.max() - cams.min()
         cam = ((cams - cams.min()) / span if span > 1e-12 else np.zeros_like(cams)).astype(np.float32)
@@ -200,4 +209,4 @@ class TriagePredictor:
             deciding_finding=PATHOLOGIES[deciding], explained_finding=PATHOLOGIES[explained],
             uncertainty=uncertainty, uncertainty_cutoff=self.cutoff, flagged=bool(uncertainty >= self.cutoff),
             flag_rate=self.flag_rate, member_immediate_scores=[float(v) for v in member_immediate],
-            gray=gray, cam=cam, overlay=overlay(gray, cam))
+            gray=gray, cam=cam, overlay=focused_overlay(gray, cam, self.cam_level))
