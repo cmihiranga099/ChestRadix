@@ -34,3 +34,5 @@ Thumbs.db
 .vscode/
 data/expert/
 data/gradcam_subset/
+
+data/bbox_subset/
