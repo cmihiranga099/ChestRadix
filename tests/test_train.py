@@ -90,3 +90,17 @@ def test_training_is_reproducible(tmp_path: Path) -> None:
     first = np.load(tmp_path / "a" / "val_logits.npy")
     second = np.load(tmp_path / "b" / "val_logits.npy")
     np.testing.assert_allclose(first, second, atol=1e-5)
+
+
+def test_training_with_weight_average_saves_a_loadable_checkpoint(tmp_path: Path) -> None:
+    data, run = tmp_path / "data", tmp_path / "run"
+    data.mkdir()
+    make_tiny_dir(data)
+    config = replace(TrainConfig(), image_size=SIZE, batch_size=4, epochs=2, patience=2,
+                     num_workers=0, amp=False)
+    summary = train_one(config, data, run, pretrained=False, max_batches=2, ema_decay=0.9)
+    assert summary["epochs_run"] >= 1 and (run / "best.pt").exists()
+    assert json.loads((run / "config.json").read_text())["ema_decay"] == 0.9
+    model, meta = load_checkpoint(run / "best.pt")
+    assert meta["extra"]["ema_decay"] == 0.9
+    assert np.load(run / "test_logits.npy").shape == (8, 14)

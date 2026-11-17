@@ -14,6 +14,7 @@ Example (Kaggle or laptop)::
 
     python -m src.train --backbone densenet121 --seed 42 --run-name e1_densenet121_s42
     python -m src.train --tier-head --seed 42 --run-name e2_densenet121_tier_s42
+    python -m src.train --seed 43 --ema-decay 0.999 --epochs 10 --run-name e5_densenet121_ema_s43
 """
 from __future__ import annotations
 
@@ -95,6 +96,7 @@ def train_one(
     time_budget_minutes: float | None = None,
     tier_head: bool = False,
     tier_loss_weight: float = 1.0,
+    ema_decay: float | None = None,
 ) -> dict[str, Any]:
     """Train one model and write all artefacts into ``run_dir``.
 
@@ -108,6 +110,9 @@ def train_one(
         tier_head: Add two tier outputs (``tier >= URGENT``, ``tier == IMMEDIATE``) trained
             together with the 14 findings. Model selection still uses the 14-class macro-AUROC.
         tier_loss_weight: Weight of the tier-head loss relative to the 14-class loss.
+        ema_decay: If set (for example 0.999), keep an exponential moving average of the weights
+            and use it for validation, model selection and the saved checkpoint. It smooths the
+            epoch-to-epoch noise of the validation score and often generalises a little better.
 
     Returns:
         Summary dictionary (also written to ``summary.json``).
@@ -139,11 +144,15 @@ def train_one(
     total_steps = max(1, steps_per_epoch * config.epochs)
     scheduler = make_scheduler(optimizer, total_steps, steps_per_epoch * config.warmup_epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    ema = None
+    if ema_decay is not None:
+        ema = torch.optim.swa_utils.AveragedModel(
+            model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(ema_decay), use_buffers=True)
 
     with (run_dir / "config.json").open("w", encoding="utf-8") as handle:
         json.dump({**config.to_dict(), "pretrained": pretrained, "max_batches": max_batches,
                    "pos_weight": pos_weight.cpu().tolist(), "tier_head": tier_head,
-                   "tier_loss_weight": tier_loss_weight,
+                   "tier_loss_weight": tier_loss_weight, "ema_decay": ema_decay,
                    "tier_pos_weight": tier_pos_weight.cpu().tolist()}, handle, indent=2)
 
     best_auroc, best_epoch, stale = -1.0, -1, 0
@@ -172,10 +181,13 @@ def train_one(
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            if ema is not None:
+                ema.update_parameters(model)
             running += float(loss.item())
             batches += 1
 
-        val_outputs, val_labels = predict_logits(model, loaders["val"], device, use_amp)
+        eval_model = ema.module if ema is not None else model
+        val_outputs, val_labels = predict_logits(eval_model, loaders["val"], device, use_amp)
         val_logits, val_tier = split_outputs(val_outputs)
         val_auroc = macro_auroc(val_labels, val_logits)
         record = {"epoch": epoch, "train_loss": running / max(1, batches),
@@ -194,9 +206,10 @@ def train_one(
 
         if val_auroc > best_auroc:
             best_auroc, best_epoch, stale = val_auroc, epoch, 0
-            save_checkpoint(checkpoint_path, model, config,
+            save_checkpoint(checkpoint_path, eval_model, config,
                             extra={"epoch": epoch, "val_macro_auroc": val_auroc,
-                                   "num_outputs": num_outputs, "tier_head": tier_head})
+                                   "num_outputs": num_outputs, "tier_head": tier_head,
+                                   "ema_decay": ema_decay})
         else:
             stale += 1
         with (run_dir / "history.json").open("w", encoding="utf-8") as handle:
@@ -256,6 +269,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tier-head", action="store_true",
                         help="Add the two tier outputs (urgent_or_higher, immediate).")
     parser.add_argument("--tier-loss-weight", type=float, default=1.0)
+    parser.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
+    parser.add_argument("--ema-decay", type=float, default=None,
+                        help="Keep an exponential moving average of the weights (for example 0.999).")
     parser.add_argument("--max-batches", type=int, default=None,
                         help="Limit batches per epoch (smoke tests only).")
     parser.add_argument("--time-budget-min", type=float, default=None)
@@ -272,13 +288,14 @@ def main() -> None:
         TrainConfig(), backbone=args.backbone, seed=args.seed, epochs=args.epochs,
         batch_size=args.batch_size, lr=args.lr, dropout=args.dropout, patience=args.patience,
         num_workers=args.num_workers, pos_weight_mode=args.pos_weight_mode,
-        image_size=args.image_size, amp=not args.no_amp,
+        image_size=args.image_size, amp=not args.no_amp, weight_decay=args.weight_decay,
     )
     processed = args.processed_dir or locate_processed_dir(config.image_size)
     name = args.run_name or f"{config.backbone}_s{config.seed}"
     train_one(config, processed, runs_dir() / name, pretrained=not args.no_pretrained,
               max_batches=args.max_batches, time_budget_minutes=args.time_budget_min,
-              tier_head=args.tier_head, tier_loss_weight=args.tier_loss_weight)
+              tier_head=args.tier_head, tier_loss_weight=args.tier_loss_weight,
+              ema_decay=args.ema_decay)
 
 
 if __name__ == "__main__":
