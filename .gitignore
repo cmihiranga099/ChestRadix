@@ -36,3 +36,5 @@ data/expert/
 data/gradcam_subset/
 
 data/bbox_subset/
+
+data/nofinding_subset/
