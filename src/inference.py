@@ -31,6 +31,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 
 from src.calibration import sigmoid
 from src.config import NUM_CLASSES, PATHOLOGIES
@@ -45,8 +46,41 @@ LOGGER = logging.getLogger("chestradix.inference")
 TIER_NAMES: tuple[str, ...] = ("ROUTINE", "URGENT", "IMMEDIATE")
 # Heat-map layer per backbone: 14 x 14 instead of the 7 x 7 last layer (better on the NIH boxes, Stage 13).
 CAM_LAYERS: dict[str, str] = {"densenet121": "features.denseblock3", "resnet50": "layer3"}
+MAX_ALPHA = 3.0          # opacity of the heat map for a confident finding
+MIN_ALPHA = 1.5          # a very weak finding is still drawn, but faintly
+FULL_ALPHA_AT = 0.5      # probability at which the heat map reaches MAX_ALPHA
+BORDERLINE_RATIO = 1.5   # tier score below 1.5 x threshold = "borderline"
 DISCLAIMER = ("Research prototype for decision support only. Not a medical device and not validated "
               "for clinical use. A qualified clinician must review every case.")
+
+
+def body_mask(gray: np.ndarray, threshold: int = 12, smooth: int = 7) -> np.ndarray:
+    """Mask of the part of the picture that is the patient (1) versus black background (0).
+
+    The grey image is smoothed, thresholded, and only the largest connected region is kept (so a
+    letter marker such as "R" that floats in the black background is dropped); holes (dark lungs)
+    are filled. If nothing passes the threshold (a very dark image) the whole image is kept.
+
+    Args:
+        gray: ``(H, W)`` uint8 radiograph.
+        threshold: Smoothed grey value above which a pixel counts as body.
+        smooth: Side of the box filter used before thresholding.
+
+    Returns:
+        ``(H, W)`` float32 array of 0 and 1.
+    """
+    blurred = ndimage.uniform_filter(np.asarray(gray, dtype=np.float32), size=smooth)
+    labels, count = ndimage.label(blurred > threshold)
+    if count == 0:
+        return np.ones(gray.shape, dtype=np.float32)
+    sizes = ndimage.sum(np.ones_like(labels), labels, index=range(1, count + 1))
+    body = ndimage.binary_fill_holes(labels == 1 + int(np.argmax(sizes)))
+    return body.astype(np.float32)
+
+
+def heat_alpha(probability: float) -> float:
+    """Opacity of the heat map: faint when the model is not sure of the finding it explains."""
+    return float(MAX_ALPHA * np.clip(probability / FULL_ALPHA_AT, MIN_ALPHA / MAX_ALPHA, 1.0))
 
 
 @dataclass
@@ -64,6 +98,7 @@ class Prediction:
     flagged: bool
     flag_rate: float
     member_immediate_scores: list[float]
+    why: dict[str, Any]
     gray: np.ndarray = field(repr=False)
     cam: np.ndarray = field(repr=False)
     overlay: np.ndarray = field(repr=False)
@@ -76,6 +111,7 @@ class Prediction:
             "deciding_finding": self.deciding_finding,
             "explained_finding": self.explained_finding,
             "probabilities": self.probabilities,
+            "why": self.why,
             "uncertainty": {"value": self.uncertainty, "cutoff": self.uncertainty_cutoff,
                             "flagged": self.flagged, "target_flag_rate": self.flag_rate,
                             "member_immediate_scores": self.member_immediate_scores},
@@ -200,13 +236,35 @@ class TriagePredictor:
         cams = np.stack([cam_maps(model, batch, explained, backbone, self.cam_method,
                                   CAM_LAYERS[backbone] if self.cam_method != "gradcam" else None)[0]
                          for model, backbone in zip(self.models, self.backbones)]).mean(axis=0)
+        cams = cams * body_mask(gray)   # no heat outside the body (black background, floating markers)
         span = cams.max() - cams.min()
         cam = ((cams - cams.min()) / span if span > 1e-12 else np.zeros_like(cams)).astype(np.float32)
 
+        why = self._why(tier, scores[0], probabilities, deciding)
         return Prediction(
             tier=TIER_NAMES[tier], urgent_score=float(scores[0, 1]), immediate_score=float(scores[0, 2]),
             probabilities={name: float(p) for name, p in zip(PATHOLOGIES, probabilities)},
             deciding_finding=PATHOLOGIES[deciding], explained_finding=PATHOLOGIES[explained],
             uncertainty=uncertainty, uncertainty_cutoff=self.cutoff, flagged=bool(uncertainty >= self.cutoff),
-            flag_rate=self.flag_rate, member_immediate_scores=[float(v) for v in member_immediate],
-            gray=gray, cam=cam, overlay=focused_overlay(gray, cam, self.cam_level))
+            flag_rate=self.flag_rate, member_immediate_scores=[float(v) for v in member_immediate], why=why,
+            gray=gray, cam=cam,
+            overlay=focused_overlay(gray, cam, self.cam_level, alpha=heat_alpha(float(probabilities[explained]))))
+
+    def _why(self, tier: int, scores: np.ndarray, probabilities: np.ndarray, deciding: int) -> dict[str, Any]:
+        """Plain-language reason for the tier: the finding, its probability, the threshold it met.
+
+        For ROUTINE nothing met a threshold: ``tier_checked`` is the tier whose score came closest
+        to its threshold, and ``ratio`` (score / threshold) is below 1.
+        """
+        thresholds = {1: self.t_urgent, 2: self.t_immediate}
+        if tier > 0:
+            threshold, score = thresholds[tier], float(scores[tier])
+            tier_name = TIER_NAMES[tier]
+        else:
+            closest = max(thresholds, key=lambda k: scores[k] / thresholds[k])
+            threshold, score, tier_name = thresholds[closest], float(scores[closest]), TIER_NAMES[closest]
+        ratio = score / threshold if threshold > 0 else float("inf")
+        strength = ("clear" if ratio >= BORDERLINE_RATIO else "borderline" if ratio >= 1.0 else "below threshold")
+        return {"finding": PATHOLOGIES[deciding], "probability": float(probabilities[deciding]),
+                "tier_checked": tier_name, "tier_score": score, "threshold": float(threshold),
+                "ratio": float(ratio), "strength": strength}

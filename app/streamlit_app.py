@@ -63,6 +63,18 @@ if upload is not None and st.button("Triage", type="primary"):
                    "whatever the tier says.")
     else:
         st.success("The models agree on this image.")
+    why = result["why"]
+    if routine:
+        st.info(f"Why ROUTINE: nothing reached a tier threshold. Closest was {why['finding']} at "
+                f"{why['probability']:.1%}; the {why['tier_checked']} score {why['tier_score']:.1%} is below "
+                f"its threshold {why['threshold']:.1%}.")
+    else:
+        note = " This is close to the threshold, so a small change could move the tier." \
+            if why["strength"] == "borderline" else ""
+        st.info(f"Why {result['tier']}: {why['finding']} at {why['probability']:.1%} is at or above the "
+                f"{result['tier']} threshold {why['threshold']:.1%} ({why['ratio']:.1f}x the threshold, "
+                f"{why['strength']}).{note} Thresholds are set to catch most serious cases, so many "
+                f"images are flagged on purpose.")
     left, right = st.columns(2)
     left.image(base64.b64decode(result["images"]["original_png_base64"]), caption="Input",
                use_container_width=True)
@@ -78,7 +90,8 @@ if upload is not None and st.button("Triage", type="primary"):
         if routine and default_finding:
             cam_caption += " No finding passed the thresholds, so this map is weak evidence."
         if p_explained < 0.20:
-            cam_caption += " The probability is low, so treat this map as unreliable."
+            cam_caption += (" The probability is low, so the colour is faint on purpose and the map is "
+                            "unreliable. Hot spots outside the lungs (markers, edges) are artefacts.")
         right.image(base64.b64decode(result["images"]["gradcam_overlay_png_base64"]),
                     caption=cam_caption, use_container_width=True)
     st.subheader("Finding probabilities (calibrated)")

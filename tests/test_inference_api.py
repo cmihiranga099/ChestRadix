@@ -12,7 +12,7 @@ from PIL import Image
 
 from src.api import create_app
 from src.config import PATHOLOGIES
-from src.inference import TriagePredictor
+from src.inference import MAX_ALPHA, MIN_ALPHA, TriagePredictor, body_mask, heat_alpha
 from src.model import build_model, save_checkpoint
 from src.train import TrainConfig
 
@@ -86,3 +86,31 @@ def test_api(predictor) -> None:
     assert "images" not in slim.json()
     assert client.post("/predict", files={"file": ("x.txt", b"hello", "text/plain")}).status_code == 400
     assert client.post("/predict?finding=Nope", files={"file": ("x.png", _png(), "image/png")}).status_code == 422
+
+
+def test_body_mask_drops_background_and_floating_marker() -> None:
+    gray = np.zeros((64, 64), dtype=np.uint8)
+    gray[16:60, 12:52] = 120                      # body
+    gray[24:36, 20:30] = 0                        # dark lung inside the body (hole)
+    gray[2:8, 2:8] = 255                          # marker floating in the background
+    mask = body_mask(gray)
+    assert mask[40, 40] == 1 and mask[30, 25] == 1    # body and its dark lung kept
+    assert mask[4, 4] == 0 and mask[62, 2] == 0       # marker and background removed
+    assert body_mask(np.zeros((16, 16), dtype=np.uint8)).min() == 1   # all dark: keep everything
+
+
+def test_heat_alpha_is_faint_for_weak_findings() -> None:
+    assert heat_alpha(0.9) == pytest.approx(MAX_ALPHA) and heat_alpha(0.5) == pytest.approx(MAX_ALPHA)
+    assert heat_alpha(0.0) == pytest.approx(MIN_ALPHA)
+    assert heat_alpha(0.1) < heat_alpha(0.3) < heat_alpha(0.6)
+
+
+def test_why_explains_the_tier(predictor) -> None:
+    result = predictor.predict(Image.open(io.BytesIO(_png())).convert("RGB"))
+    why = result.why
+    assert why["finding"] == result.deciding_finding
+    assert why["probability"] == pytest.approx(result.probabilities[why["finding"]])
+    assert why["strength"] in ("clear", "borderline", "below threshold")
+    assert (result.tier == "ROUTINE") == (why["ratio"] < 1.0)
+    assert (why["strength"] == "below threshold") == (why["ratio"] < 1.0)
+    assert result.to_dict()["why"] == why
