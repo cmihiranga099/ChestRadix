@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.artifact_check import CATEGORIES, artifact_check, classify_peak, format_report
+from src.artifact_check import CATEGORIES, artifact_check, classify_peak, format_report, no_finding_check
 from src.config import TrainConfig
 from src.model import build_model, save_checkpoint
 
@@ -48,3 +48,26 @@ def test_artifact_check_end_to_end(tmp_path) -> None:
         assert set(report[block]) == set(CATEGORIES) and abs(sum(report[block].values()) - 1) < 1e-9
     assert report["with_mask"]["background"] == 0.0   # the mask removes every background peak
     assert "no mask" in format_report(report)
+
+
+def test_no_finding_check_samples_only_normal_images(tmp_path) -> None:
+    from src.config import PATHOLOGIES
+
+    torch.manual_seed(0)
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    n = 8
+    images = np.zeros((n, 64, 64), dtype=np.uint8)
+    images[:, 10:60, 10:54] = 120
+    np.save(processed / "images_64.npy", images)
+    names = [f"{i}.png" for i in range(n)]
+    pd.DataFrame({"image": names, "row": range(n)}).to_csv(processed / "image_index.csv", index=False)
+    labels = pd.DataFrame(0, index=range(n), columns=list(PATHOLOGIES))
+    labels.loc[:3, "Mass"] = 1                       # four images have a finding, four have none
+    frame = pd.concat([pd.DataFrame({"image": names, "patient_id": range(n)}), labels], axis=1)
+    frame.to_csv(processed / "test.csv", index=False)
+    model = build_model("densenet121", 14, 0.0, pretrained=False)
+    save_checkpoint(tmp_path / "best.pt", model, TrainConfig(image_size=64, backbone="densenet121"))
+    report = no_finding_check([tmp_path / "best.pt"], processed, tmp_path / "nf.json", n=100)
+    assert report["n_pairs"] == 4 and (tmp_path / "nf.json").exists()
+    assert report["with_mask"]["background"] == 0.0
